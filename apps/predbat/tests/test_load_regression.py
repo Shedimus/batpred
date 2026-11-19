@@ -31,6 +31,7 @@ def test_load_regression(my_predbat=None):
     - Model save/load with version check
     - Cold start and gaps in the data
     - LoadMLComponent picking the model, keeping a model file per type, and training, predicting and publishing with it
+    - load_ml_shadow running the other model without the plan using it
     """
     sub_tests = [
         ("training_recovers_weights", _test_training_recovers_weights, "Fit recovers known weights and explain() adds up"),
@@ -42,6 +43,9 @@ def test_load_regression(my_predbat=None):
         ("nan_inf_robustness", _test_nan_inf_robustness, "Handles NaN, Inf, and None in its inputs"),
         ("component_selects_model", _test_component_selects_model, "load_ml_model picks the predictor, its model file and its minimum history"),
         ("component_end_to_end", _test_component_end_to_end, "LoadMLComponent trains, predicts and publishes with the regression"),
+        ("shadow_picks_other_model", _test_shadow_picks_other_model, "load_ml_shadow runs the model that is not selected, with its own model file"),
+        ("shadow_never_reaches_plan", _test_shadow_never_reaches_plan, "The shadow trains, forecasts and publishes on its own sensors without touching the main forecast"),
+        ("shadow_in_run_cycle", _test_shadow_in_run_cycle, "run() handles the shadow only after the main forecast is published"),
     ]
 
     failed_tests = []
@@ -354,3 +358,106 @@ def _test_component_end_to_end():
         short._do_fetch = no_fetch
         assert asyncio.run(short.run(seconds=0, first=True))
         assert short.model_status == "insufficient_data", short.model_status
+
+
+def _test_shadow_picks_other_model():
+    """The shadow is whichever model is not selected, saves to that model's own file and is off by default."""
+    from load_ml_component import LoadMLComponent
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        assert LoadMLComponent(_MockBase(config_root=tmpdir), load_ml_enable=True).shadow is None, "Shadow should be off by default"
+
+        component = LoadMLComponent(_MockBase(config_root=tmpdir), load_ml_enable=True, load_ml_shadow=True)
+        assert component.shadow.model == "regression" and isinstance(component.shadow.predictor, LoadRegressionPredictor)
+        assert os.path.basename(component.shadow.filepath) == "predbat_ml_regression.npz" and isinstance(component.predictor, LoadPredictor)
+
+        component = LoadMLComponent(_MockBase(config_root=tmpdir), load_ml_enable=True, load_ml_model="regression", load_ml_shadow=True)
+        assert component.shadow.model == "mlp" and isinstance(component.shadow.predictor, LoadPredictor)
+        assert os.path.basename(component.shadow.filepath) == "predbat_ml_model.npz" and component.shadow.status == "not_initialized"
+
+        # A saved model is picked up by the shadow on restart, just as by the main model
+        np.random.seed(42)
+        predictor = LoadRegressionPredictor()
+        predictor.train(_create_synthetic_load_data(n_days=14))
+        predictor.save(os.path.join(tmpdir, "predbat_ml_regression.npz"))
+        component = LoadMLComponent(_MockBase(config_root=tmpdir), load_ml_enable=True, load_ml_shadow=True)
+        assert component.shadow.status == "active" and component.shadow.last_train_time == predictor.training_timestamp
+
+
+def _test_shadow_never_reaches_plan():
+    """The shadow regression trains, forecasts and publishes on shadow sensors only; the MLP's state, file and sensors are untouched."""
+    from load_ml_component import LoadMLComponent
+
+    np.random.seed(42)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = _MockBase(config_root=tmpdir)
+        component = LoadMLComponent(base, load_ml_enable=True, load_ml_shadow=True, load_ml_database_days=0)
+        component.load_data = _create_synthetic_load_data(n_days=14, now_utc=base.now_utc)
+        component.temperature_data = _create_synthetic_temp_data(n_days=14, now_utc=base.now_utc, forecast_hours=48)
+        component.load_data_age_days = 14
+        component.data_ready = True
+        component.last_data_fetch = base.now_utc
+        component.dashboard_item = Mock()
+
+        # Held back on the first run, as the main model's training is
+        asyncio.run(component._run_shadow(first=True))
+        assert component.shadow.last_train_time is None and component.shadow.status == "not_initialized"
+
+        component.dashboard_item.reset_mock()
+        asyncio.run(component._run_shadow(first=False))
+        shadow = component.shadow
+        assert shadow.status == "active" and shadow.last_train_time is not None, shadow.status
+        assert len(shadow.predictions) == 48 * 60 // STEP_MINUTES and len(shadow.breakdown) == 96
+        assert os.path.exists(os.path.join(tmpdir, "predbat_ml_regression.npz")), "The shadow's model should be saved"
+        assert not os.path.exists(os.path.join(tmpdir, "predbat_ml_model.npz")), "The main model's file should not be written"
+
+        # Nothing of the main model changed: fetch.py reads the plan's forecast from sensor.predbat_load_ml_forecast only
+        assert component.current_predictions == {} and component.current_breakdown == {}
+        assert component.model_status == "not_initialized" and not component.model_valid and component.last_train_time is None
+        assert not component.predictor.model_initialized, "The main MLP should not have been trained"
+        published = {call.args[0]: call.kwargs for call in component.dashboard_item.call_args_list}
+        assert sorted(published) == ["sensor.predbat_load_ml_shadow_forecast", "sensor.predbat_load_ml_shadow_stats"], sorted(published)
+        forecast = published["sensor.predbat_load_ml_shadow_forecast"]
+        stats = published["sensor.predbat_load_ml_shadow_stats"]["attributes"]
+        assert forecast["state"] == "active" and len(forecast["attributes"]["results"]) == len(shadow.predictions) and len(forecast["attributes"]["breakdown"]) == 96
+        assert stats["model"] == "regression" and sorted(stats["weights"]) == sorted(TERMS) and stats["mae_kwh"] is not None
+
+        # Within the retrain interval it forecasts again without refitting
+        trained_at = shadow.last_train_time
+        asyncio.run(component._run_shadow(first=False))
+        assert shadow.last_train_time == trained_at and shadow.status == "active"
+
+        # Too little history for the regression: no training, an empty forecast and a status that says why
+        short = LoadMLComponent(_MockBase(config_root=None), load_ml_enable=True, load_ml_shadow=True, load_ml_database_days=0)
+        short.load_data = _create_synthetic_load_data(n_days=5)
+        short.load_data_age_days = 5
+        short.data_ready = True
+        short.dashboard_item = Mock()
+        asyncio.run(short._run_shadow(first=False))
+        assert short.shadow.status == "insufficient_data" and short.shadow.predictions == {}
+        states = {call.args[0]: call.kwargs["state"] for call in short.dashboard_item.call_args_list}
+        assert states["sensor.predbat_load_ml_shadow_forecast"] == "insufficient_data", states
+
+
+def _test_shadow_in_run_cycle():
+    """run() handles the shadow after publishing the main forecast, and not at all when the shadow is off."""
+    from unittest.mock import AsyncMock, MagicMock
+    from load_ml_component import LoadMLComponent
+
+    for shadow_on in (True, False):
+        base = _MockBase(config_root=None)
+        component = LoadMLComponent(base, load_ml_enable=True, load_ml_model="regression", load_ml_shadow=shadow_on, load_ml_database_days=0)
+        component.data_ready = True
+        component.load_data_age_days = 14
+        component.initial_training_done = True
+        component.last_train_time = base.now_utc
+        order = MagicMock()
+        component._do_fetch = AsyncMock()
+        component._get_predictions = order.predict
+        component._publish_entity = order.publish
+        component._run_shadow = AsyncMock(side_effect=lambda first: order.shadow(first))
+
+        assert asyncio.run(component.run(seconds=1800, first=False))
+        calls = [call[0] for call in order.mock_calls]
+        expected = ["predict", "publish", "shadow"] if shadow_on else ["predict", "publish"]
+        assert calls == expected, (shadow_on, calls)
