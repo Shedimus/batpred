@@ -264,6 +264,7 @@ firstparty
 flextras
 fline
 FLOMASTA
+fmax
 fontsize
 fontweight
 footgun
@@ -426,6 +427,7 @@ loglines
 lookback
 lpignore
 lstrip
+lstsq
 luxpower
 luxpowertek
 luxpython
@@ -488,6 +490,7 @@ myenergi
 mypy
 nanmean
 nanstd
+nansum
 nattribute
 nbytes
 ncalls

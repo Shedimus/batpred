@@ -3120,6 +3120,7 @@ APPS_SCHEMA = {
     "load_history_fill_enable": {"type": "boolean"},
     "load_ml_enable": {"type": "boolean"},
     "load_ml_retrain_interval_hours": {"type": "integer", "min": 1, "max": 48},
+    "load_ml_model": {"type": "string", "allowed": ["mlp", "regression"]},
     "gateway_device_id": {"type": "string", "empty": False},
     "gateway_mqtt_host": {"type": "string", "empty": False},
     "gateway_mqtt_port": {"type": "integer", "zero": False},

@@ -2165,6 +2165,7 @@ For a detailed explanation of how the neural network works and comprehensive con
 | `load_ml_max_days_history` | Integer | No | 28 | `load_ml_max_days_history` | Maximum days of load history to fetch from HA on each poll (bounded by HA recorder retention) |
 | `load_ml_database_days` | Integer | No | 90 | `load_ml_database_days` | Days of history to accumulate in the on-disk database (`predbat_ml_history.npz`); set to 0 to disable the database |
 | `load_ml_retrain_interval_hours` | Integer | No | 2 | `load_ml_retrain_interval_hours` | Hours between training cycles (1–48); use 24 for daily retraining. Predictions still update every 30 minutes |
+| `load_ml_model` | String | No | mlp | `load_ml_model` | `mlp` for the neural network, or `regression` for [LoadReg](load-ml.md#loadreg-the-regression-model), a four-input linear regression that trains in under a second and needs 10 days of history |
 
 Note: **load_today**, **pv_today** and **car_charging_energy** `apps.yaml` configuration items are also used, but these should already be set in Predbat.
 
@@ -2185,6 +2186,9 @@ predbat:
 
   # Optional: hours between training cycles (default 2, range 1-48)
   # load_ml_retrain_interval_hours: 24
+
+  # Optional: mlp (neural network, default) or regression (LoadReg)
+  # load_ml_model: regression
 
   # Optional but recommended: enable temperature forecasts
   temperature_enable: true

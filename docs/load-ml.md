@@ -2,11 +2,13 @@
 
 Predbat includes a neural network-based machine learning component that can predict your household energy consumption for the next 48 hours.
 This prediction is based on historical load patterns, time-of-day patterns, day-of-week patterns, and optionally PV generation history and temperature forecasts.
+A simpler alternative model, [LoadReg](#loadreg-the-regression-model), a four-input linear regression, can be selected with `load_ml_model: regression`.
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [How the Neural Network Works](#how-the-neural-network-works)
+- [LoadReg: the Regression Model](#loadreg-the-regression-model)
 - [Configuration](#configuration)
 - [History Accumulation and the Database](#history-accumulation-and-the-database)
 - [Setup Instructions](#setup-instructions)
@@ -187,6 +189,103 @@ This allows the model to adapt quickly to recent changes (via time weighting) wi
 - If validation error exceeds threshold (default 2.0 kWh MAE), predictions are disabled
 - Model is considered stale after 48 hours and requires retraining
 
+## LoadReg: the Regression Model
+
+Instead of the neural network, Load ML can run LoadReg, a four-input linear regression. Select it with `load_ml_model: regression` in `apps.yaml`:
+
+```yaml
+predbat:
+  load_ml_enable: true
+  load_ml_model: regression
+```
+
+Everything else stays the same: the history it learns from, the history database, the `load_ml_*` options, the sensors, the charts and `load_ml_source`.
+Each model keeps its own saved model file, so you can switch between them and back without losing either.
+
+In short, LoadReg:
+
+- Forecasts 48 hours of load. It works in 30-minute slots and the forecast is published in 5-minute steps
+- Follows your recent daily pattern, and adjusts it for the temperature forecast and for how the last day and the last 2 hours have gone
+- Needs 10 days of load history before it will train (the neural network needs 1)
+- Refits on the whole history every `load_ml_retrain_interval_hours`, which takes well under a second
+- Publishes its weights and a per-slot breakdown of the forecast, so you can see why it predicts what it does
+
+### How LoadReg works
+
+For each 30-minute slot in the next 48 hours the forecast is:
+
+```text
+load = base
+     + profile weight     x profile
+     + temperature weight x temperature
+     + last_2h weight     x last_2h
+     + last_24h weight    x last_24h
+```
+
+| Input | What it is | Units |
+| --- | --- | --- |
+| `profile` | Typical load at the same time of day over the 7 days before now: the mean of those days without the highest one, scaled so that a whole day of the profile adds up to the plain 7-day mean | kWh per 30 minutes |
+| `temperature` | Heating degrees forecast for the slot, minus the mean heating degrees at that time of day over the last 7 days. Heating degrees are how far the outside temperature is below 15.5 °C, and zero above it | °C |
+| `last_2h` | Mean load over the last 2 hours minus the profile for those 2 hours. It fades as the forecast goes further ahead, to 37% after 2 hours and 5% after 6 hours | kWh per 30 minutes |
+| `last_24h` | Mean load over the last 24 hours minus the mean over the last 7 days | kWh per 30 minutes |
+
+`base` is a constant amount of energy per slot.
+
+The profile carries the shape of your day. Leaving out the highest day at each time of day stops a one-off (an oven, guests, a car charge that was not subtracted) being forecast again at the same time for the following week.
+That energy was still used, so the profile is scaled back up to the week's mean daily total, which spreads it over the day. Where fewer than 3 of the 7 days are recorded for a time of day the plain mean is used.
+A profile weight below 1 together with a positive base pulls the forecast a little towards your average load, because a 7-day profile is a noisy estimate of any one half hour.
+The temperature weight is the extra energy you use in a half hour for each degree it is colder than it has been for that time of day this week, so it is close to zero for a house without electric heating.
+The last two inputs carry today's level: a day that is running heavy is forecast to stay somewhat heavy.
+
+The forecast for each slot is kept between zero and 50 kW, then spread evenly over its six 5-minute steps.
+
+### LoadReg training and validation
+
+Training is ordinary least squares. Every half hour in the history is treated as a time a forecast could have been made, and each of those gives up to 96 rows (one per slot ahead) of inputs and the load that then happened.
+The weights are the ones that fit all of those rows best. There are no epochs, learning rates or random starting points, so the same history always gives the same weights.
+
+Missing data is left out: a slot with a gap in its load is not used, and a slot with no temperature gets no temperature adjustment.
+If you have no temperature data at all the temperature weight is zero and the model runs on the other three inputs.
+
+Each time it trains, the model is first fitted without the newest 48 hours, asked to forecast those 48 hours from the point where they began, and scored against what happened.
+The result is published as `mae_kwh` (the mean absolute error, in kWh per 30-minute slot) and `bias_kwh` (the mean of forecast minus actual, so a negative value is under-forecasting). The model is then refitted on all of the history for use.
+These figures come from data the model had not seen, so they are a fair guide to how the forecast performs, but they cover only 2 days, so expect them to move from one training to the next.
+Note that LoadReg's `mae_kwh` is per 30 minutes, while the neural network's is per 5 minutes, so the two are not directly comparable.
+
+The same 2.0 kWh validation threshold and 48-hour staleness limit apply as for the neural network.
+
+PV generation, import and export rates and the day of the week are not inputs.
+PV (in the slot, over the hours before it and over the day) and weekends were tested on histories of 30 to 53 days from four households. Neither improved the forecast across those houses once the four inputs above were in, and each made at least one house worse, so they were left out to keep the model small.
+Rates could not be tested, as none of the four histories had a rate that varied within the day.
+
+"Same time of day" means whole days back from now. For up to a week after a clock change the profile is therefore an hour out against your household routine.
+
+### Reading the LoadReg weights
+
+The weights are on `sensor.predbat_load_ml_stats` in the `weights` attribute (and `model` is `regression`), and in the log each time the model trains:
+
+```text
+LoadReg Predictor: Fitted on 209136 forecast slots: load per 30 min = 0.104 + 0.743 x profile + 0.0305 x heating degrees above last week + 0.441 x last 2h above profile + 0.137 x last 24h above last week; holdout MAE 0.1656 kWh, bias -0.1019 kWh
+```
+
+`sensor.predbat_load_ml_forecast` has a `breakdown` attribute alongside `results`. It holds one entry per 30-minute slot giving the kWh each term adds, and their total:
+
+```yaml
+breakdown:
+  "2026-11-12T18:00:00+0000":
+    base: 0.1042
+    profile: 0.5562
+    temperature: 0.0641
+    last_2h: 0.0356
+    last_24h: 0.0306
+    total: 0.7907
+```
+
+Read this one as: your profile for this time of day is 0.75 kWh a half hour (0.5562 / 0.743), the slot is forecast 2.1 °C colder than the week's average for the time (0.0641 / 0.0305), the last 2 hours ran 0.08 kWh a half hour above the profile, and the last day ran 0.22 kWh a half hour above the week.
+The terms add up to the total unless the total was clipped at zero or at the 50 kW limit.
+
+The neural network's `rollout_mae_kwh`, `pattern_mae_kwh` and `epochs_trained` attributes are not published when LoadReg is selected.
+
 ## Configuration
 
 ### Basic Setup
@@ -211,12 +310,18 @@ predbat:
 
   # Optional: Retrain once a day instead of every 2 hours
   # load_ml_retrain_interval_hours: 24
+
+  # Optional: mlp (the neural network, default) or regression (LoadReg)
+  # load_ml_model: regression
 ```
 
 **Configuration Parameter Details:**
 
 - `load_ml_enable`: Enables the ML component (required), defaults to false.
 - `load_ml_source`: When `true`, Predbat uses ML predictions for battery planning. Set to `false` (the default) to test predictions without affecting battery control
+- `load_ml_model`: Which model forecasts the load: `mlp`, the neural network (the default), or `regression`, [LoadReg](#loadreg-the-regression-model)
+    - Each model saves to its own file, so switching keeps both. Restart Predbat after changing it
+    - An unrecognised value is logged as a warning and the neural network is used
 - `load_ml_retrain_interval_hours`: Hours between training cycles, measured from the model's last training time
     - **Default**: 2 hours
     - **Range**: Whole hours from 1 to 48; out-of-range values are clamped to these limits because models become stale after 48 hours
@@ -537,7 +642,7 @@ Access predictions via:
 
 ## Model Persistence
 
-Two files are saved to your Predbat config directory:
+Two files are saved to your Predbat config directory, plus `predbat_ml_regression.npz` if you use LoadReg:
 
 ### `predbat_ml_model.npz` — the trained neural network
 
@@ -553,6 +658,11 @@ The model is automatically loaded on Predbat restart, allowing predictions to co
 **Note**: If you update Predbat and the model architecture or version changes, the old model will be rejected and a new model will be trained from scratch. If the model becomes unstable, you can manually delete `predbat_ml_model.npz` to force retraining.
 The training history in `predbat_ml_history.npz` is kept, so the new model trains on it straight away, and Predbat plans with its normal historical load forecast until training finishes.
 Model version 11 (the first Predbat release after v9.9.0) is one such change: models saved by earlier versions are retrained once after the update, because a model trained on unbounded rate spikes can be left predicting a flat line, and bounding the inputs does not repair it.
+
+### `predbat_ml_regression.npz` — the fitted LoadReg model
+
+Written only when `load_ml_model: regression` is set. It holds the five weights, the training timestamp, the holdout `mae_kwh` and `bias_kwh`, and the LoadReg model version.
+It is reloaded on restart like the neural network's file, and can be deleted at any time to force a refit, which takes under a second.
 
 ### `predbat_ml_history.npz` — the accumulated history database
 

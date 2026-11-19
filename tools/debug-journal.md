@@ -522,8 +522,9 @@ Grep for the named symbol rather than trusting a line number. Each area lists du
 - Two routes to the fallback target (21.5 °C): an unset `heating_energy` meter pinned `minute_data_age` to 0 (PR #5867); `EntityHistory.prune_history()` dropped the state-in-force record, so an `unavailable` blip floored age to 0 for 24 h (PR #5837).
 - Traps: `run_simulation(save="best")` publishes HA entities, so a parameter sweep overwrites the sensors; Predheat reads `datetime.now(local_tz)`, so build history mocks against wall-clock time.
 
-### Load ML (`load_ml_component.py`, `load_predictor.py`)
+### Load ML (`load_ml_component.py`, `load_predictor.py`, `load_regression.py`)
 
+- `load_ml_model` (default `mlp`) picks the predictor. `regression` is LoadReg (`load_regression.py`), a four-input least-squares model (trimmed 7-day profile, heating degrees, last 2 h, last 24 h) that fits in well under a second and needs `MIN_HISTORY_DAYS` = 10. It saves to `predbat_ml_regression.npz`, not `predbat_ml_model.npz`; both share `predbat_ml_history.npz`. Its `mae_kwh` is per 30 minutes, the MLP's per 5. The component branches on `self.ml_model` in `_new_predictor`, `_get_predictions`, `_do_training` and `_publish_entity` only.
 - The 2-hourly retrain is a curriculum of passes (`ml_curriculum_step_days`/`ml_curriculum_max_passes`, hardcoded), a 16–40 minute CPU spike every 2 h (GH#3896, GH#5213). `threads` reaches only the C++ kernel and nothing caps BLAS threads, so NumPy may use every core.
 - On "CPU regressed after upgrade", reconstruct from the log when fine-tunes ran under each version; a version window under 2 h proves nothing (GH#5213).
 - `load_ml_retrain_interval_hours` (PR #5433, 2026-10-12; default 2, max 48) is age-based, not clock-aware. Past `ml_max_model_age_hours = 48`, `is_valid()` returns `"stale"` and ML predictions fall back to empty.
