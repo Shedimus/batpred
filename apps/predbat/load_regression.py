@@ -3,7 +3,7 @@
 # Copyright Trefor Southwell 2026 - All Rights Reserved
 # This application maybe used for personal use only and not for commercial use
 # -----------------------------------------------------------------------------
-# LoadReg - four-input linear regression load predictor
+# LoadReg - five-input linear regression load predictor
 # -----------------------------------------------------------------------------
 # fmt off
 # pylint: disable=consider-using-f-string
@@ -14,11 +14,13 @@
 """LoadReg: linear regression for household load forecasting, an alternative to the LoadML MLP in load_predictor.py.
 
 One ordinary least-squares model forecasts the next 48 hours in 30-minute slots.
-The load in a future slot is a base amount plus four weighted inputs:
+The load in a future slot is a base amount plus five weighted inputs:
 
     profile      typical load at the same time of day over the 7 days before the forecast: the mean without the
                  highest day, scaled so that a day of it still adds up to the plain 7-day mean
-    temperature  heating degrees (below 15.5 C) in the slot, minus their 7-day mean for that time of day
+    temperature  heating degrees (below 12 C) in the slot, minus their 7-day mean for that time of day
+    cold         degrees below 5 C in the slot, minus their 7-day mean for that time of day: the extra a heat pump
+                 uses per degree in cold weather. Only fitted when there is enough cold weather to learn it from
     last_2h      how far the last 2 hours ran above the profile, fading out over the next few hours
     last_24h     mean load over the last 24 hours minus the mean over the last 7 days
 
@@ -30,7 +32,7 @@ import json
 import os
 from datetime import datetime, timezone
 
-MODEL_VERSION = 1  # Saved models of another version are refitted
+MODEL_VERSION = 2  # Saved models of another version are refitted
 STEP_MINUTES = 5  # Resolution of the input data and of the forecast returned
 SLOT_MINUTES = 30  # Resolution the model works at
 SLOT_STEPS = SLOT_MINUTES // STEP_MINUTES
@@ -39,9 +41,11 @@ PROFILE_DAYS = 7  # Days the time-of-day profile is built from
 PREDICT_HORIZON = 2 * SLOTS_PER_DAY  # 48 hours of 30-minute slots
 RECENT_SLOTS = 4  # The "last 2 hours"
 RECENT_FADE_SLOTS = 4  # The last 2 hours term decays by 1/e every 2 hours ahead
-HEATING_BASE_TEMP = 15.5  # No heating load is assumed above this outside temperature (C)
+HEATING_BASE_TEMP = 12.0  # No heating load is assumed above this outside temperature (C)
+COLD_TEMP = 5.0  # Below this the cold term adds a second, usually steeper, slope (C)
+COLD_MIN_DAYS = 3  # Days' worth of half hours below COLD_TEMP in the history before the cold term is fitted
 MIN_HISTORY_DAYS = PROFILE_DAYS + 3  # 7 days of profile, 2 days held out for validation and 1 day to fit on
-TERMS = ["base", "profile", "temperature", "last_2h", "last_24h"]
+TERMS = ["base", "profile", "temperature", "cold", "last_2h", "last_24h"]
 
 
 def nanmean(values, axis):
@@ -75,6 +79,7 @@ class LoadRegressionPredictor:
         self.max_load_kw = max_load_kw
 
         self.weights = None  # One per entry of TERMS, set by train()
+        self.cold_fitted = False  # Whether the last train() fitted the cold term (its weight is zero when not)
         self.training_timestamp = None
         self.validation_mae = None  # kWh per 30 minutes over the 48 hours held out
         self.validation_bias = None  # Mean (predicted - actual) over the same 48 hours; + = over-predicting
@@ -125,7 +130,7 @@ class LoadRegressionPredictor:
         """
         slots = max(load_minutes) // SLOT_MINUTES + 1
         load = self._slots(load_minutes, 0, slots, total=True)
-        heating = np.maximum(HEATING_BASE_TEMP - self._slots(temp_minutes or {}, -PREDICT_HORIZON, slots, total=False), 0)
+        temperature = self._slots(temp_minutes or {}, -PREDICT_HORIZON, slots, total=False)
 
         def same_time(values):
             """Values at each slot stacked with those at the same slot on each of the PROFILE_DAYS - 1 days before it."""
@@ -142,7 +147,6 @@ class LoadRegressionPredictor:
         trimmed = np.where(count >= 3, (np.nansum(days, axis=0) - np.fmax.reduce(days, axis=0)) / np.maximum(count - 1, 1), mean)
         trimmed_day = rolling_nanmean(trimmed, SLOTS_PER_DAY)
         scale = np.where(trimmed_day > 0, rolling_nanmean(mean, SLOTS_PER_DAY) / np.where(trimmed_day > 0, trimmed_day, 1), 1.0)[origins]
-        heating_profile = nanmean(same_time(heating[PREDICT_HORIZON:]), axis=0)
         week = PROFILE_DAYS * SLOTS_PER_DAY
         last_24h = (rolling_nanmean(load, SLOTS_PER_DAY)[: slots - week + 1] - rolling_nanmean(load, week))[origins]
         last_2h = rolling_nanmean(load, RECENT_SLOTS)[origins] - scale * rolling_nanmean(trimmed, RECENT_SLOTS)[origins]
@@ -151,13 +155,19 @@ class LoadRegressionPredictor:
         target = origins[:, None] - 1 - ahead[None, :]  # Slot being forecast, negative when it has not happened yet
         newest = origins[:, None] + SLOTS_PER_DAY - 1 - ahead[None, :] % SLOTS_PER_DAY  # Newest history slot at the target's time of day
 
+        def degrees_below(base):
+            """Degrees below base in the target slot, minus their mean at that time of day over the last week.
+            No temperature known for the slot or for its time of day in the last week means no adjustment."""
+            degrees = np.maximum(base - temperature, 0)
+            return np.nan_to_num(degrees[target + PREDICT_HORIZON] - nanmean(same_time(degrees[PREDICT_HORIZON:]), axis=0)[newest])
+
         inputs = np.empty(target.shape + (len(TERMS),))
-        inputs[..., 0] = 1.0
-        inputs[..., 1] = trimmed[newest] * scale[:, None]
-        # No temperature known for the slot or for its time of day in the last week means no adjustment
-        inputs[..., 2] = np.nan_to_num(heating[target + PREDICT_HORIZON] - heating_profile[newest])
-        inputs[..., 3] = last_2h[:, None] * np.exp(-ahead / RECENT_FADE_SLOTS)[None, :]
-        inputs[..., 4] = last_24h[:, None]
+        inputs[..., TERMS.index("base")] = 1.0
+        inputs[..., TERMS.index("profile")] = trimmed[newest] * scale[:, None]
+        inputs[..., TERMS.index("temperature")] = degrees_below(HEATING_BASE_TEMP)
+        inputs[..., TERMS.index("cold")] = degrees_below(COLD_TEMP)
+        inputs[..., TERMS.index("last_2h")] = last_2h[:, None] * np.exp(-ahead / RECENT_FADE_SLOTS)[None, :]
+        inputs[..., TERMS.index("last_24h")] = last_24h[:, None]
         actual = np.where(target >= 0, load[np.maximum(target, 0)], np.nan)
         return inputs, actual
 
@@ -185,25 +195,49 @@ class LoadRegressionPredictor:
         usable = ~np.isnan(actual) & ~np.isnan(inputs).any(axis=-1)
         target = origins[:, None] - 1 - np.arange(PREDICT_HORIZON)[None, :]
 
-        def fit(rows):
-            """Least-squares weights for the selected (origin, slot ahead) rows."""
-            return np.linalg.lstsq(inputs[rows], actual[rows], rcond=None)[0]
-
         seen = usable & (target >= PREDICT_HORIZON)
         held_out = usable[PREDICT_HORIZON - 1]  # The forecast made 48 hours ago, origins start at 1
         if seen.sum() < 10 * len(TERMS) or not held_out.any():
             self.log("Warn: LoadReg Predictor: Not enough complete load history to train")
             return None
-        error = self._clip(inputs[PREDICT_HORIZON - 1][held_out] @ fit(seen)) - actual[PREDICT_HORIZON - 1][held_out]
 
-        self.weights = fit(usable)
+        def fit_and_score(rows_inputs):
+            """Weights fitted on everything, plus the error on the held-out 48 hours of a fit made without them."""
+            fit = lambda rows: np.linalg.lstsq(rows_inputs[rows], actual[rows], rcond=None)[0]
+            error = self._clip(rows_inputs[PREDICT_HORIZON - 1][held_out] @ fit(seen)) - actual[PREDICT_HORIZON - 1][held_out]
+            return fit(usable), error
+
+        # The cold term is only fitted with enough cold weather in the history to learn its slope from, and only kept
+        # when heating comes out as using more energy the colder it gets. Otherwise its input is zeroed and it gets
+        # no weight: a slope learned from a handful of cold days, or from a house that does not heat electrically, is noise
+        temperature = self._slots(temp_minutes or {}, 0, slots, total=False)
+        cold_slots = int(np.sum(temperature[~np.isnan(temperature)] < COLD_TEMP))
+        self.cold_fitted = cold_slots >= COLD_MIN_DAYS * SLOTS_PER_DAY
+        no_cold = inputs.copy()
+        no_cold[..., TERMS.index("cold")] = 0.0
+        weights, error = fit_and_score(inputs if self.cold_fitted else no_cold)
+        if self.cold_fitted and (weights[TERMS.index("cold")] < 0 or weights[TERMS.index("temperature")] < 0):
+            self.cold_fitted = False
+            weights, error = fit_and_score(no_cold)
+        if not self.cold_fitted:
+            weights[TERMS.index("cold")] = 0.0  # Least squares leaves rounding noise on an all-zero input
+
+        self.weights = weights
         self.validation_mae = float(np.mean(np.abs(error)))
         self.validation_bias = float(np.mean(error))
         self.training_timestamp = datetime.now(timezone.utc)
         self.model_initialized = True
         self.log(
-            "LoadReg Predictor: Fitted on {} forecast slots: load per 30 min = {:.3f} + {:.3f} x profile + {:.4f} x heating degrees above last week + {:.3f} x last 2h above profile + {:.3f} x last 24h above last week; "
-            "holdout MAE {:.4f} kWh, bias {:+.4f} kWh".format(int(usable.sum()), *self.weights, self.validation_mae, self.validation_bias)
+            "LoadReg Predictor: Fitted on {} forecast slots: load per 30 min = {:.3f} + {:.3f} x profile + {:.4f} x heating degrees above last week + {:.4f} x degrees below {:g} C above last week ({}) "
+            "+ {:.3f} x last 2h above profile + {:.3f} x last 24h above last week; holdout MAE {:.4f} kWh, bias {:+.4f} kWh".format(
+                int(usable.sum()),
+                *self.weights[:4],
+                COLD_TEMP,
+                "fitted" if self.cold_fitted else "off, {:.1f} days below {:g} C".format(cold_slots / SLOTS_PER_DAY, COLD_TEMP) if cold_slots < COLD_MIN_DAYS * SLOTS_PER_DAY else "off, slope came out negative",
+                *self.weights[4:],
+                self.validation_mae,
+                self.validation_bias,
+            )
         )
         return self.validation_mae
 
