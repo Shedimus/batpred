@@ -3699,6 +3699,13 @@ chart.render();
                 {"name": "Forecast (+8h)", "data": load_today_h8, "opacity": "0.7", "stroke_width": "2", "stroke_curve": "smooth", "color": "#9b59b6"},
                 {"name": "Load (ML Forecast)", "data": load_ml_forecast, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "smooth", "color": "#eb2323"},
             ]
+            # With load_ml_shadow the other model's forecast is shown alongside for comparison; the plan never uses it
+            load_ml_shadow_forecast = self.get_entity_results("sensor." + self.prefix + "_load_ml_shadow_forecast")
+            if load_ml_shadow_forecast:
+                shadow_model = self.base.dashboard_values.get("sensor." + self.prefix + "_load_ml_shadow_stats", {}).get("attributes", {}).get("model", "")
+                series_data.append(
+                    {"name": "Load (Shadow {} Forecast)".format(shadow_model) if shadow_model else "Load (Shadow Forecast)", "data": load_ml_shadow_forecast, "opacity": "0.8", "stroke_width": "2", "stroke_curve": "smooth", "color": "#2ecc71"}
+                )
             text += self.render_chart(series_data, "kWh", "ML Load Forecast", now_str)
         elif chart == "LoadMLPower":
             # Get historical load power

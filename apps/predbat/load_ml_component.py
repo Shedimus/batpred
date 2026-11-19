@@ -19,7 +19,8 @@ status sensor publishing. Retrains every 2 hours by default and updates predicti
 every 30 minutes.
 
 load_ml_model picks the predictor: "mlp" (LoadPredictor in load_predictor.py, the default)
-or "regression" (LoadReg, LoadRegressionPredictor in load_regression.py).
+or "regression" (LoadReg, LoadRegressionPredictor in load_regression.py). With load_ml_shadow
+the other model is run too and published on its own sensors, which the plan never reads.
 """
 
 import asyncio
@@ -44,6 +45,20 @@ DATABASE_VERSION = 1
 LOAD_ML_MODELS = ["mlp", "regression"]
 
 
+class ShadowModel:
+    """The model run in shadow: trained, forecast and published like the main one, but never used by the plan."""
+
+    def __init__(self, model):
+        """Start with no predictor, no training and no forecast."""
+        self.model = model
+        self.predictor = None
+        self.filepath = None
+        self.status = "not_initialized"
+        self.last_train_time = None
+        self.predictions = {}
+        self.breakdown = {}
+
+
 class LoadMLComponent(ComponentBase):
     """
     ML Load Forecaster component that predicts household load for the next 48 hours.
@@ -57,10 +72,12 @@ class LoadMLComponent(ComponentBase):
     - Falls back to empty predictions when validation fails or model is stale
     """
 
-    # Set by initialize(); the class default keeps an instance built without it on the MLP, as before load_ml_model existed
+    # Set by initialize(); the class defaults keep an instance built without it on the MLP with no shadow,
+    # as before load_ml_model and load_ml_shadow existed
     ml_model = LOAD_ML_MODELS[0]
+    shadow = None
 
-    def initialize(self, load_ml_enable, load_ml_source=True, load_ml_max_days_history=28, load_ml_database_days=90, load_ml_retrain_interval_hours=2, load_ml_model="mlp"):
+    def initialize(self, load_ml_enable, load_ml_source=True, load_ml_max_days_history=28, load_ml_database_days=90, load_ml_retrain_interval_hours=2, load_ml_model="mlp", load_ml_shadow=False):
         """
         Initialise the ML load forecaster component.
 
@@ -71,6 +88,7 @@ class LoadMLComponent(ComponentBase):
             load_ml_database_days: Number of days of historical data to store in the database, maximum length for training
             load_ml_retrain_interval_hours: Hours between training cycles, clamped to 1-48
             load_ml_model: "mlp" for the neural network or "regression" for LoadReg
+            load_ml_shadow: Also run the other model and publish its forecast, without the plan using it
         """
 
         self.ml_enable = load_ml_enable
@@ -79,6 +97,8 @@ class LoadMLComponent(ComponentBase):
         if self.ml_model not in LOAD_ML_MODELS:
             self.log("Warn: ML Component: load_ml_model '{}' is not one of {}, using '{}'".format(load_ml_model, LOAD_ML_MODELS, LOAD_ML_MODELS[0]))
             self.ml_model = LOAD_ML_MODELS[0]
+        # Shadow mode: the model not selected runs alongside, publishing to sensors the plan never reads
+        self.shadow = ShadowModel(next(model for model in LOAD_ML_MODELS if model != self.ml_model)) if load_ml_shadow else None
         self.ml_load_sensor = self.get_arg("load_today", default=[], indirect=False)
         self.ml_load_power_sensor = self.get_arg("load_power", default=[], indirect=False)
         self.ml_pv_sensor = self.get_arg("pv_today", default=[], indirect=False)
@@ -95,8 +115,7 @@ class LoadMLComponent(ComponentBase):
         self.ml_epochs_update = 30
         self.ml_patience_initial = 10
         self.ml_patience_update = 10
-        # The regression needs a week of profile behind every forecast it fits on, plus its 2-day holdout
-        self.ml_min_days = load_regression.MIN_HISTORY_DAYS if self.ml_model == "regression" else 1
+        self.ml_min_days = self._min_history_days(self.ml_model)
         self.ml_validation_threshold = 2.0
         self.ml_time_decay_days = 30
         self.ml_max_load_kw = 50.0
@@ -153,9 +172,19 @@ class LoadMLComponent(ComponentBase):
         # Initialise predictor
         self._init_predictor()
 
-    def _new_predictor(self):
-        """Create an untrained predictor of the selected model type."""
-        if self.ml_model == "regression":
+    @staticmethod
+    def _min_history_days(model):
+        """Days of load history a model needs before it trains; the regression needs a week of profile behind every forecast it fits on, plus its 2-day holdout."""
+        return load_regression.MIN_HISTORY_DAYS if model == "regression" else 1
+
+    @staticmethod
+    def _model_filename(model):
+        """Saved model file for a model type, one per type so switching between them keeps both."""
+        return "predbat_ml_regression.npz" if model == "regression" else "predbat_ml_model.npz"
+
+    def _new_predictor(self, model=None):
+        """Create an untrained predictor of the given model type, by default the selected one."""
+        if (model or self.ml_model) == "regression":
             return load_regression.LoadRegressionPredictor(log_func=self.log, max_load_kw=self.ml_max_load_kw)
         return LoadPredictor(log_func=self.log, learning_rate=self.ml_learning_rate, max_load_kw=self.ml_max_load_kw, weight_decay=self.ml_weight_decay, dropout_rate=self.ml_dropout_rate)
 
@@ -163,9 +192,9 @@ class LoadMLComponent(ComponentBase):
         """Initialise or reinitialise the predictor."""
         self.predictor = self._new_predictor()
 
-        # Determine model save path, one file per model type so switching between them keeps both
+        # Determine model save path
         if self.config_root:
-            self.model_filepath = os.path.join(self.config_root, "predbat_ml_regression.npz" if self.ml_model == "regression" else "predbat_ml_model.npz")
+            self.model_filepath = os.path.join(self.config_root, self._model_filename(self.ml_model))
             self.database_filepath = os.path.join(self.config_root, "predbat_ml_history.npz")
         else:
             self.model_filepath = None
@@ -191,6 +220,9 @@ class LoadMLComponent(ComponentBase):
                 # Reinitialise predictor to ensure clean state
                 self.log("ML Component: Failed to load model, reinitialising predictor")
                 self.predictor = self._new_predictor()
+
+        if self.shadow:
+            self._init_shadow()
 
     def is_calculating(self):
         """Return whether the component is currently calculating predictions."""
@@ -740,24 +772,11 @@ class LoadMLComponent(ComponentBase):
             self.log("ML Component: Generating predictions load data age {:.1f} days, {} data points".format(self.load_data_age_days, len(self.load_data) if self.load_data else 0))
             if 0:
                 self._log_prediction_input_table(now_utc)
-            if self.ml_model == "regression":
-                predictions = self.predictor.predict(self.load_data, temp_minutes=self.temperature_data)
-            else:
-                predictions = self.predictor.predict(
-                    self.load_data,
-                    now_utc,
-                    midnight_utc,
-                    pv_minutes=self.pv_data,
-                    temp_minutes=self.temperature_data,
-                    import_rates=self.import_rates_data,
-                    export_rates=self.export_rates_data,
-                    exog_features=exog_features,
-                )
+            predictions, breakdown = self._predict_with(self.ml_model, self.predictor, now_utc, midnight_utc, exog_features)
 
             if predictions:
                 self.current_predictions = predictions
-                if self.ml_model == "regression":
-                    self.current_breakdown = self.predictor.explain(self.load_data, temp_minutes=self.temperature_data)
+                self.current_breakdown = breakdown
                 self.log("ML Component: Generated {} predictions (total {:.2f} kWh over 48h)".format(len(predictions), max(predictions.values()) if predictions else 0))
             else:
                 self.log("ML Component: Predictor returned no predictions, returning previous dict")
@@ -767,6 +786,29 @@ class LoadMLComponent(ComponentBase):
         except Exception as e:
             self.log("Error: ML Component: Prediction failed: {}".format(e))
             return {}
+
+    def _predict_with(self, model, predictor, now_utc, midnight_utc, exog_features=None):
+        """
+        Forecast from the current data with a predictor of the given model type.
+
+        Returns:
+            Tuple of ({minute: cumulative_kwh}, breakdown), the breakdown being the regression's
+            {minutes_ahead: {term: kwh}} per 30-minute slot and empty for the MLP
+        """
+        if model == "regression":
+            predictions = predictor.predict(self.load_data, temp_minutes=self.temperature_data)
+            return predictions, predictor.explain(self.load_data, temp_minutes=self.temperature_data) if predictions else {}
+        predictions = predictor.predict(
+            self.load_data,
+            now_utc,
+            midnight_utc,
+            pv_minutes=self.pv_data,
+            temp_minutes=self.temperature_data,
+            import_rates=self.import_rates_data,
+            export_rates=self.export_rates_data,
+            exog_features=exog_features,
+        )
+        return predictions, {}
 
     async def run(self, seconds, first):
         """
@@ -864,6 +906,10 @@ class LoadMLComponent(ComponentBase):
                     # Publish entity with current state
                     self._publish_entity()
                     self.log("ML Component: Prediction cycle completed")
+
+                    # The shadow runs after the main forecast is published, so it can never hold up or change it
+                    if self.shadow:
+                        await self._run_shadow(first)
 
                     # Write database if enabled (uses np.savez_compressed - keep inside guard)
                     if self.load_ml_database_days:
@@ -1028,73 +1074,12 @@ class LoadMLComponent(ComponentBase):
         Args:
             is_initial: True for full training, False for fine-tuning
         """
-        # Snapshot data under the lock so we can release it before the CPU-bound
-        # training call.  predictor.train() can take 30-120 seconds on slow hardware
-        # and must NOT run while holding data_lock or the asyncio event loop will freeze.
-        async with self.data_lock:
-            if not self.load_data:
-                self.log("Warn: ML Component: No data for training")
-                return
-
-            if self.load_data_age_days < 3:
-                self.log("Warn: ML Component: Training with only {} days of data, recommend 3+ days for better accuracy".format(self.load_data_age_days))
-
-            # Shallow copies are sufficient - predictor.train() only reads the dicts
-            load_data_snap = dict(self.load_data)
-            pv_data_snap = dict(self.pv_data) if self.pv_data else {}
-            temp_data_snap = dict(self.temperature_data) if self.temperature_data else {}
-            import_rates_snap = dict(self.import_rates_data) if self.import_rates_data else {}
-            export_rates_snap = dict(self.export_rates_data) if self.export_rates_data else {}
-            now_utc_snap = self.now_utc
-            epochs = self.ml_epochs_initial if is_initial else self.ml_epochs_update
-            time_decay = min(self.ml_time_decay_days, self.load_data_age_days)
-            holdout_hours = self.ml_validation_holdout_hours
-            patience = self.ml_patience_initial if is_initial else self.ml_patience_update
-            max_intermediate_passes = self.ml_curriculum_max_passes
-            window_days = self.ml_curriculum_window_days
-            step_days = self.ml_curriculum_step_days
-        # Lock released - event loop is free during training
+        snapshot = await self._snapshot_training_data()
+        if snapshot is None:
+            return
 
         try:
-            if self.ml_model == "regression":
-                # A least-squares fit, well under a second, so there is no curriculum or fine-tuning
-                val_mae = self.predictor.train(load_data_snap, temp_minutes=temp_data_snap)
-            elif is_initial:
-                # Curriculum: progressively expand the training window from oldest week
-                # forward so the model learns gradually from historical structure.
-                val_mae = self.predictor.train_curriculum(
-                    load_data_snap,
-                    now_utc_snap,
-                    pv_minutes=pv_data_snap,
-                    temp_minutes=temp_data_snap,
-                    import_rates=import_rates_snap,
-                    export_rates=export_rates_snap,
-                    epochs=epochs,
-                    time_decay_days=time_decay,
-                    validation_holdout_hours=holdout_hours,
-                    patience=patience,
-                    curriculum_window_days=window_days,
-                    curriculum_step_days=5,
-                    max_intermediate_passes=8,
-                    progress_callback=self.update_success_timestamp,
-                )
-            else:
-                val_mae = self.predictor.train_curriculum(
-                    load_data_snap,
-                    now_utc_snap,
-                    pv_minutes=pv_data_snap,
-                    temp_minutes=temp_data_snap,
-                    import_rates=import_rates_snap,
-                    export_rates=export_rates_snap,
-                    epochs=epochs,
-                    time_decay_days=time_decay,
-                    validation_holdout_hours=holdout_hours,
-                    patience=patience,
-                    curriculum_window_days=window_days,
-                    curriculum_step_days=step_days,
-                    max_intermediate_passes=max_intermediate_passes,
-                    progress_callback=self.update_success_timestamp,
-                )
+            val_mae = self._fit(self.ml_model, self.predictor, snapshot, is_initial)
 
             if val_mae is not None:
                 self.last_train_time = datetime.now(timezone.utc)
@@ -1119,6 +1104,141 @@ class LoadMLComponent(ComponentBase):
         except Exception as e:
             self.log("Error: ML Component: Training exception: {}".format(e))
             self.log("Error: " + traceback.format_exc())
+
+    async def _snapshot_training_data(self):
+        """
+        Copy the training data under the lock, so the lock is released before the CPU-bound fit.
+
+        Training the MLP can take 30-120 seconds on slow hardware and must NOT run while holding
+        data_lock or the asyncio event loop will freeze.
+
+        Returns:
+            Dict of the data to train on, or None if there is none
+        """
+        async with self.data_lock:
+            if not self.load_data:
+                self.log("Warn: ML Component: No data for training")
+                return None
+
+            if self.load_data_age_days < 3:
+                self.log("Warn: ML Component: Training with only {} days of data, recommend 3+ days for better accuracy".format(self.load_data_age_days))
+
+            # Shallow copies are sufficient - training only reads the dicts
+            return {
+                "load": dict(self.load_data),
+                "pv": dict(self.pv_data) if self.pv_data else {},
+                "temp": dict(self.temperature_data) if self.temperature_data else {},
+                "import_rates": dict(self.import_rates_data) if self.import_rates_data else {},
+                "export_rates": dict(self.export_rates_data) if self.export_rates_data else {},
+                "now_utc": self.now_utc,
+            }
+
+    def _fit(self, model, predictor, snapshot, is_initial):
+        """
+        Train a predictor of the given model type on a snapshot from _snapshot_training_data.
+
+        Args:
+            model: "mlp" or "regression"
+            predictor: The predictor to train
+            snapshot: Training data
+            is_initial: For the MLP, True for the full curriculum, False for fine-tuning
+
+        Returns:
+            Validation MAE, or None if training failed
+        """
+        if model == "regression":
+            # A least-squares fit, well under a second, so there is no curriculum or fine-tuning
+            return predictor.train(snapshot["load"], temp_minutes=snapshot["temp"])
+
+        # Curriculum: progressively expand the training window from oldest week forward so the model
+        # learns gradually from historical structure. The initial training takes bigger steps over more passes.
+        return predictor.train_curriculum(
+            snapshot["load"],
+            snapshot["now_utc"],
+            pv_minutes=snapshot["pv"],
+            temp_minutes=snapshot["temp"],
+            import_rates=snapshot["import_rates"],
+            export_rates=snapshot["export_rates"],
+            epochs=self.ml_epochs_initial if is_initial else self.ml_epochs_update,
+            time_decay_days=min(self.ml_time_decay_days, self.load_data_age_days),
+            validation_holdout_hours=self.ml_validation_holdout_hours,
+            patience=self.ml_patience_initial if is_initial else self.ml_patience_update,
+            curriculum_window_days=self.ml_curriculum_window_days,
+            curriculum_step_days=5 if is_initial else self.ml_curriculum_step_days,
+            max_intermediate_passes=8 if is_initial else self.ml_curriculum_max_passes,
+            progress_callback=self.update_success_timestamp,
+        )
+
+    def _init_shadow(self):
+        """Create the shadow predictor and load its saved model, if there is one."""
+        shadow = self.shadow
+        shadow.predictor = self._new_predictor(shadow.model)
+        shadow.filepath = os.path.join(self.config_root, self._model_filename(shadow.model)) if self.config_root else None
+        if shadow.filepath and os.path.exists(shadow.filepath):
+            if shadow.predictor.load(shadow.filepath):
+                self.log("ML Component: Loaded existing shadow {} model".format(shadow.model))
+                shadow.last_train_time = shadow.predictor.training_timestamp
+            else:
+                shadow.predictor = self._new_predictor(shadow.model)
+        self._update_shadow_status()
+
+    def _update_shadow_status(self):
+        """Set the shadow's status the same way as the main model's."""
+        shadow = self.shadow
+        if not shadow.predictor or not shadow.predictor.model_initialized:
+            shadow.status = "not_initialized"
+            return
+        is_valid, reason = shadow.predictor.is_valid(validation_threshold=self.ml_validation_threshold, max_age_hours=self.ml_max_model_age_hours)
+        shadow.status = "active" if is_valid else "fallback_" + reason
+
+    async def _run_shadow(self, first):
+        """
+        Train the shadow model when it is due, forecast with it and publish the forecast on its own sensors.
+
+        It trains on the same data and interval as the main model. Its forecast is never handed to
+        the plan: it only goes to sensor.<prefix>_load_ml_shadow_forecast and _shadow_stats.
+
+        Args:
+            first: True on the component's first run, when training is held back as for the main model
+        """
+        shadow = self.shadow
+        if self.load_data_age_days < self._min_history_days(shadow.model):
+            shadow.status = "insufficient_data"
+            shadow.predictions, shadow.breakdown = {}, {}
+            self._publish_shadow()
+            return
+
+        age_seconds = (self.now_utc - shadow.last_train_time).total_seconds() if shadow.last_train_time else None
+        if not first and (age_seconds is None or age_seconds >= self.ml_retrain_interval_seconds):
+            self.log("ML Component: Training shadow {} model".format(shadow.model))
+            snapshot = await self._snapshot_training_data()
+            if snapshot is not None:
+                try:
+                    val_mae = self._fit(shadow.model, shadow.predictor, snapshot, is_initial=shadow.last_train_time is None)
+                except Exception as e:
+                    self.log("Error: ML Component: Shadow training exception: {}".format(e))
+                    val_mae = None
+                if val_mae is not None:
+                    shadow.last_train_time = datetime.now(timezone.utc)
+                    self.log("ML Component: Shadow {} model trained, val_mae={:.4f} kWh".format(shadow.model, val_mae))
+                    if shadow.filepath:
+                        shadow.predictor.save(shadow.filepath)
+                else:
+                    self.log("Warn: ML Component: Shadow {} model training failed".format(shadow.model))
+
+                # As for the main model, a long training run leaves the data behind the clock, so re-fetch before forecasting
+                stale_minutes = (self.now_utc - self.last_data_fetch).total_seconds() / 60.0 if self.last_data_fetch else 0
+                if stale_minutes >= PREDICT_STEP:
+                    await self._do_fetch()
+
+        self._update_shadow_status()
+        shadow.predictions, shadow.breakdown = {}, {}
+        if shadow.status == "active" and self.data_ready:
+            try:
+                shadow.predictions, shadow.breakdown = self._predict_with(shadow.model, shadow.predictor, self.now_utc, self.midnight_utc)
+            except Exception as e:
+                self.log("Error: ML Component: Shadow prediction failed: {}".format(e))
+        self._publish_shadow()
 
     def _update_model_status(self):
         """Update model validity status based on current state."""
@@ -1161,64 +1281,122 @@ class LoadMLComponent(ComponentBase):
         )
         return derived_baseline
 
+    def _forecast_results(self, predictions, load_minutes_now):
+        """
+        Turn predictions into the published form: cumulative kWh since local midnight by timestamp, resetting at each midnight.
+
+        Args:
+            predictions: Dict of {minute: cumulative_kwh from now}
+            load_minutes_now: Load so far today, the baseline the forecast is added to
+
+        Returns:
+            Dict with "results" ({timestamp: kWh}) and the load and power 1 and 8 hours ahead
+        """
+        forecast = {"results": {}, "load_today_h1": 0, "load_today_h8": 0, "power_today_now": 0, "power_today_h1": 0, "power_today_h8": 0}
+        reset_amount = 0
+        prev_value = 0
+        for minute, value in (predictions or {}).items():
+            # The predictor's values are numpy, and round() keeps them numpy: publish plain floats, as a numpy
+            # scalar in an attribute reaches the debug yaml as a pickled object
+            value = float(value)
+            timestamp = self.midnight_utc + timedelta(minutes=minute + self.minutes_now)
+            timestamp_str = timestamp.strftime(TIME_FORMAT)
+            # Reset at midnight
+            if minute > 0 and ((minute + self.minutes_now) % (24 * 60) == 0):
+                reset_amount = value + load_minutes_now
+            output_value = round(value - reset_amount + load_minutes_now, 4)
+            forecast["results"][timestamp_str] = output_value
+            delta_value = (value - prev_value) / PREDICT_STEP * 60.0
+            if minute == 0:
+                forecast["power_today_now"] = delta_value
+            if minute == 60:
+                forecast["load_today_h1"] = output_value
+                forecast["power_today_h1"] = delta_value
+            if minute == 60 * 8:
+                forecast["load_today_h8"] = output_value
+                forecast["power_today_h8"] = delta_value
+            prev_value = value
+        return forecast
+
+    def _model_attributes(self, model, predictor, breakdown):
+        """
+        Attributes that only one of the models has.
+
+        Returns:
+            Tuple of (extra forecast sensor attributes, extra stats sensor attributes)
+        """
+        if model == "regression":
+            # Per-slot breakdown keyed by time, so any forecast value can be traced to its inputs
+            forecast_extra = {"breakdown": {(self.midnight_utc + timedelta(minutes=minute + self.minutes_now)).strftime(TIME_FORMAT): terms for minute, terms in breakdown.items()}}
+            weights = predictor.weights if predictor else None
+            return forecast_extra, {
+                "model_version": load_regression.MODEL_VERSION,
+                "weights": {term: round(float(weight), 4) for term, weight in zip(load_regression.TERMS, weights)} if weights is not None else None,
+            }
+        return {}, {
+            # Multi-step rollout error and the daily-pattern baseline it is scored against.
+            # mae_kwh is teacher-forced and stays small even when the rollout collapses.
+            "rollout_mae_kwh": round(float(predictor.rollout_mae), 4) if predictor and predictor.rollout_mae is not None else None,
+            "pattern_mae_kwh": round(float(predictor.pattern_mae), 4) if predictor and predictor.pattern_mae is not None else None,
+            "model_version": MODEL_VERSION,
+            "epochs_trained": predictor.epochs_trained if predictor else 0,
+        }
+
+    def _publish_shadow(self):
+        """Publish the shadow model's forecast and stats on sensors of their own, which the plan never reads."""
+        shadow = self.shadow
+        load_minutes_now = float(self._load_baseline_now())
+        forecast = self._forecast_results(shadow.predictions, load_minutes_now)
+        forecast_extra, stats_extra = self._model_attributes(shadow.model, shadow.predictor, shadow.breakdown)
+        total_kwh = float(max(shadow.predictions.values())) if shadow.predictions else 0
+        model_age_hours = shadow.predictor.get_model_age_hours() if shadow.predictor else None
+        predictor = shadow.predictor
+
+        self.dashboard_item(
+            "sensor." + self.prefix + "_load_ml_shadow_forecast",
+            state=shadow.status,
+            attributes={
+                "results": forecast["results"],
+                **forecast_extra,
+                "friendly_name": "ML Load Shadow Forecast",
+                "icon": "mdi:chart-line",
+            },
+            app="load_ml",
+        )
+        self.dashboard_item(
+            "sensor." + self.prefix + "_load_ml_shadow_stats",
+            state=round(total_kwh, 2),
+            attributes={
+                "load_today": dp2(load_minutes_now),
+                "load_today_h1": dp2(forecast["load_today_h1"]),
+                "load_today_h8": dp2(forecast["load_today_h8"]),
+                "load_total": dp2(total_kwh),
+                "mae_kwh": round(float(predictor.validation_mae), 4) if predictor and predictor.validation_mae is not None else None,
+                "bias_kwh": round(predictor.validation_bias, 4) if predictor and predictor.validation_bias is not None else None,
+                "last_trained": shadow.last_train_time.isoformat() if shadow.last_train_time else None,
+                "model_age_hours": round(model_age_hours, 1) if model_age_hours is not None else None,
+                "training_days": self.load_data_age_days,
+                "status": shadow.status,
+                "model": shadow.model,
+                **stats_extra,
+                "friendly_name": "ML Load Shadow Stats",
+                "state_class": "measurement",
+                "unit_of_measurement": "kWh",
+                "icon": "mdi:chart-line",
+            },
+            app="load_ml",
+        )
+
     def _publish_entity(self):
         """Publish the load_forecast_ml entity with current predictions."""
-        # Convert predictions to timestamp format for entity
-        results = {}
-        reset_amount = 0
-        load_today_h1 = 0
-        load_today_h8 = 0
-        power_today_now = 0
-        power_today_h1 = 0
-        power_today_h8 = 0
-        # The predictor's values are numpy, and round() keeps them numpy: publish plain floats, as a numpy
-        # scalar in an attribute reaches the debug yaml as a pickled object
         load_minutes_now = float(self._load_baseline_now())
-        # Future predictions
-        if self.current_predictions:
-            prev_value = 0
-            for minute, value in self.current_predictions.items():
-                value = float(value)
-                timestamp = self.midnight_utc + timedelta(minutes=minute + self.minutes_now)
-                timestamp_str = timestamp.strftime(TIME_FORMAT)
-                # Reset at midnight
-                if minute > 0 and ((minute + self.minutes_now) % (24 * 60) == 0):
-                    reset_amount = value + load_minutes_now
-                output_value = round(value - reset_amount + load_minutes_now, 4)
-                results[timestamp_str] = output_value
-                delta_value = (value - prev_value) / PREDICT_STEP * 60.0
-                if minute == 0:
-                    power_today_now = delta_value
-                if minute == 60:
-                    load_today_h1 = output_value
-                    power_today_h1 = delta_value
-                if minute == 60 * 8:
-                    load_today_h8 = output_value
-                    power_today_h8 = delta_value
-                prev_value = value
+        forecast = self._forecast_results(self.current_predictions, load_minutes_now)
+        results = forecast["results"]
 
         # Get model age
         model_age_hours = self.predictor.get_model_age_hours() if self.predictor else None
 
-        # Attributes that only one of the models has
-        if self.ml_model == "regression":
-            # Per-slot breakdown keyed by time, so any forecast value can be traced to its inputs
-            forecast_extra = {"breakdown": {(self.midnight_utc + timedelta(minutes=minute + self.minutes_now)).strftime(TIME_FORMAT): terms for minute, terms in self.current_breakdown.items()}}
-            weights = self.predictor.weights if self.predictor else None
-            stats_extra = {
-                "model_version": load_regression.MODEL_VERSION,
-                "weights": {term: round(float(weight), 4) for term, weight in zip(load_regression.TERMS, weights)} if weights is not None else None,
-            }
-        else:
-            forecast_extra = {}
-            stats_extra = {
-                # Multi-step rollout error and the daily-pattern baseline it is scored against.
-                # mae_kwh is teacher-forced and stays small even when the rollout collapses.
-                "rollout_mae_kwh": round(float(self.predictor.rollout_mae), 4) if self.predictor and self.predictor.rollout_mae is not None else None,
-                "pattern_mae_kwh": round(float(self.predictor.pattern_mae), 4) if self.predictor and self.predictor.pattern_mae is not None else None,
-                "model_version": MODEL_VERSION,
-                "epochs_trained": self.predictor.epochs_trained if self.predictor else 0,
-            }
+        forecast_extra, stats_extra = self._model_attributes(self.ml_model, self.predictor, self.current_breakdown)
 
         # Calculate total predicted load
         total_kwh = float(max(self.current_predictions.values())) if self.current_predictions else 0
@@ -1239,12 +1417,12 @@ class LoadMLComponent(ComponentBase):
             state=round(total_kwh, 2),
             attributes={
                 "load_today": dp2(load_minutes_now),
-                "load_today_h1": dp2(load_today_h1),
-                "load_today_h8": dp2(load_today_h8),
+                "load_today_h1": dp2(forecast["load_today_h1"]),
+                "load_today_h8": dp2(forecast["load_today_h8"]),
                 "load_total": dp2(total_kwh),
-                "power_today_now": dp2(power_today_now),
-                "power_today_h1": dp2(power_today_h1),
-                "power_today_h8": dp2(power_today_h8),
+                "power_today_now": dp2(forecast["power_today_now"]),
+                "power_today_h1": dp2(forecast["power_today_h1"]),
+                "power_today_h8": dp2(forecast["power_today_h8"]),
                 "mae_kwh": round(float(self.predictor.validation_mae), 4) if self.predictor and self.predictor.validation_mae is not None else None,
                 "bias_kwh": round(self.predictor.validation_bias, 4) if self.predictor and self.predictor.validation_bias is not None else None,
                 "last_trained": self.last_train_time.isoformat() if self.last_train_time else None,

@@ -285,6 +285,32 @@ The terms add up to the total unless the total was clipped at zero or at the 50 
 
 The neural network's `rollout_mae_kwh`, `pattern_mae_kwh` and `epochs_trained` attributes are not published when LoadReg is selected.
 
+### Comparing the two models: shadow mode
+
+Set `load_ml_shadow: true` to run the model you have not selected alongside the one you have:
+
+```yaml
+predbat:
+  load_ml_enable: true
+  load_ml_model: mlp      # this model's forecast is the one the plan can use
+  load_ml_shadow: true    # LoadReg runs too, for comparison only
+```
+
+The shadow trains on the same history and at the same `load_ml_retrain_interval_hours`, keeps its own saved model file, and publishes to sensors of its own:
+
+- `sensor.predbat_load_ml_shadow_forecast`: the shadow's status, with its `results` (and `breakdown` for LoadReg)
+- `sensor.predbat_load_ml_shadow_stats`: its 48-hour total, with `model`, `mae_kwh`, `bias_kwh`, `load_today_h1`, `load_today_h8` and the model's own attributes
+
+The plan never uses the shadow forecast, whatever `load_ml_source` is set to. It runs after the main forecast has been published, so it never changes it, though a shadow MLP's long training can hold up the next 30-minute refresh.
+The LoadML chart shows the shadow forecast as a second line.
+
+Things to know:
+
+- A shadow MLP costs as much CPU as running the MLP as your main model, including its long first training.
+- The shadow only runs once the main model has enough history. With LoadReg as the main model, an MLP shadow waits for LoadReg's 10 days.
+- LoadReg's `mae_kwh` is per 30 minutes and the MLP's per 5 minutes, so compare the forecasts, or `load_today_h1` and `load_today_h8` against actual load, rather than the two `mae_kwh` figures.
+- To swap which model drives the plan, change `load_ml_model` and restart. Both models' saved files are kept, so neither has to start again.
+
 ## Configuration
 
 ### Basic Setup
@@ -312,6 +338,9 @@ predbat:
 
   # Optional: mlp (the neural network, default) or regression (LoadReg)
   # load_ml_model: regression
+
+  # Optional: also run the other model for comparison, without the plan using it
+  # load_ml_shadow: true
 ```
 
 **Configuration Parameter Details:**
@@ -321,6 +350,7 @@ predbat:
 - `load_ml_model`: Which model forecasts the load: `mlp`, the neural network (the default), or `regression`, [LoadReg](#loadreg-the-regression-model)
     - Each model saves to its own file, so switching keeps both. Restart Predbat after changing it
     - An unrecognised value is logged as a warning and the neural network is used
+- `load_ml_shadow`: When `true`, the model not chosen by `load_ml_model` also runs and publishes its forecast to `sensor.predbat_load_ml_shadow_forecast` and `sensor.predbat_load_ml_shadow_stats`, which the plan never uses. Defaults to false. See [shadow mode](#comparing-the-two-models-shadow-mode)
 - `load_ml_retrain_interval_hours`: Hours between training cycles, measured from the model's last training time
     - **Default**: 2 hours
     - **Range**: Whole hours from 1 to 48; out-of-range values are clamped to these limits because models become stale after 48 hours
@@ -641,7 +671,7 @@ Access predictions via:
 
 ## Model Persistence
 
-Two files are saved to your Predbat config directory, plus `predbat_ml_regression.npz` if you use LoadReg:
+Two files are saved to your Predbat config directory, plus `predbat_ml_regression.npz` if you use LoadReg (as the main model or the shadow):
 
 ### `predbat_ml_model.npz` — the trained neural network
 
@@ -658,7 +688,7 @@ The model is automatically loaded on Predbat restart, allowing predictions to co
 
 ### `predbat_ml_regression.npz` — the fitted LoadReg model
 
-Written only when `load_ml_model: regression` is set. It holds the five weights, the training timestamp, the holdout `mae_kwh` and `bias_kwh`, and the LoadReg model version.
+Written only when LoadReg runs, as `load_ml_model: regression` or as the shadow. It holds the five weights, the training timestamp, the holdout `mae_kwh` and `bias_kwh`, and the LoadReg model version.
 It is reloaded on restart like the neural network's file, and can be deleted at any time to force a refit, which takes under a second.
 
 ### `predbat_ml_history.npz` — the accumulated history database
