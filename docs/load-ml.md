@@ -2,7 +2,7 @@
 
 Predbat includes a neural network-based machine learning component that can predict your household energy consumption for the next 48 hours.
 This prediction is based on historical load patterns, time-of-day patterns, day-of-week patterns, and optionally PV generation history and temperature forecasts.
-A simpler alternative model, [LoadReg](#loadreg-the-regression-model), a four-input linear regression, can be selected with `load_ml_model: regression`.
+A simpler alternative model, [LoadReg](#loadreg-the-regression-model), a five-input linear regression, can be selected with `load_ml_model: regression`.
 
 ## Table of Contents
 
@@ -191,7 +191,7 @@ This allows the model to adapt quickly to recent changes (via time weighting) wi
 
 ## LoadReg: the Regression Model
 
-Instead of the neural network, Load ML can run LoadReg, a four-input linear regression. Select it with `load_ml_model: regression` in `apps.yaml`:
+Instead of the neural network, Load ML can run LoadReg, a five-input linear regression. Select it with `load_ml_model: regression` in `apps.yaml`:
 
 ```yaml
 predbat:
@@ -218,6 +218,7 @@ For each 30-minute slot in the next 48 hours the forecast is:
 load = base
      + profile weight     x profile
      + temperature weight x temperature
+     + cold weight        x cold
      + last_2h weight     x last_2h
      + last_24h weight    x last_24h
 ```
@@ -225,7 +226,8 @@ load = base
 | Input | What it is | Units |
 | --- | --- | --- |
 | `profile` | Typical load at the same time of day over the 7 days before now: the mean of those days without the highest one, scaled so that a whole day of the profile adds up to the plain 7-day mean | kWh per 30 minutes |
-| `temperature` | Heating degrees forecast for the slot, minus the mean heating degrees at that time of day over the last 7 days. Heating degrees are how far the outside temperature is below 15.5 °C, and zero above it | °C |
+| `temperature` | Heating degrees forecast for the slot, minus the mean heating degrees at that time of day over the last 7 days. Heating degrees are how far the outside temperature is below 12 °C, and zero above it | °C |
+| `cold` | The same, but for degrees below 5 °C: how far the slot is forecast below 5 °C, minus the mean at that time of day over the last 7 days | °C |
 | `last_2h` | Mean load over the last 2 hours minus the profile for those 2 hours. It fades as the forecast goes further ahead, to 37% after 2 hours and 5% after 6 hours | kWh per 30 minutes |
 | `last_24h` | Mean load over the last 24 hours minus the mean over the last 7 days | kWh per 30 minutes |
 
@@ -235,6 +237,12 @@ The profile carries the shape of your day. Leaving out the highest day at each t
 That energy was still used, so the profile is scaled back up to the week's mean daily total, which spreads it over the day. Where fewer than 3 of the 7 days are recorded for a time of day the plain mean is used.
 A profile weight below 1 together with a positive base pulls the forecast a little towards your average load, because a 7-day profile is a noisy estimate of any one half hour.
 The temperature weight is the extra energy you use in a half hour for each degree it is colder than it has been for that time of day this week, so it is close to zero for a house without electric heating.
+The cold weight is what each degree below 5 °C adds on top of that. A heat pump gets less efficient as it gets colder, so its energy per degree climbs in cold weather, and a single straight line under-forecasts cold snaps.
+Together the two make a line that bends at 5 °C, so the slope is the temperature weight between 12 °C and 5 °C, and the two weights added together below 5 °C.
+
+The cold term is only fitted when the history has at least 3 days' worth of half hours below 5 °C, and is dropped if either temperature weight comes out negative (using less energy the colder it gets is not heating, and is noise).
+Otherwise its weight is zero, so a house that does not heat with electricity, or a history that has not had a cold spell yet, gets the plain straight line.
+The log says each time it trains whether the cold term was fitted, and if not, why.
 The last two inputs carry today's level: a day that is running heavy is forecast to stay somewhat heavy.
 
 The forecast for each slot is kept between zero and 50 kW, then spread evenly over its six 5-minute steps.
@@ -245,7 +253,7 @@ Training is ordinary least squares. Every half hour in the history is treated as
 The weights are the ones that fit all of those rows best. There are no epochs, learning rates or random starting points, so the same history always gives the same weights.
 
 Missing data is left out: a slot with a gap in its load is not used, and a slot with no temperature gets no temperature adjustment.
-If you have no temperature data at all the temperature weight is zero and the model runs on the other three inputs.
+If you have no temperature data at all the temperature and cold weights are zero and the model runs on the other three inputs.
 
 Each time it trains, the model is first fitted without the newest 48 hours, asked to forecast those 48 hours from the point where they began, and scored against what happened.
 The result is published as `mae_kwh` (the mean absolute error, in kWh per 30-minute slot) and `bias_kwh` (the mean of forecast minus actual, so a negative value is under-forecasting). The model is then refitted on all of the history for use.
@@ -255,8 +263,13 @@ Note that LoadReg's `mae_kwh` is per 30 minutes, while the neural network's is p
 The same 2.0 kWh validation threshold and 48-hour staleness limit apply as for the neural network.
 
 PV generation, import and export rates and the day of the week are not inputs.
-PV (in the slot, over the hours before it and over the day) and weekends were tested on histories of 30 to 53 days from four households. Neither improved the forecast across those houses once the four inputs above were in, and each made at least one house worse, so they were left out to keep the model small.
+PV (in the slot, over the hours before it and over the day) and weekends were tested on histories of 30 to 53 days from four households. Neither improved the forecast across those houses once the other inputs above were in, and each made at least one house worse, so they were left out to keep the model small.
 Rates could not be tested, as none of the four histories had a rate that varied within the day.
+
+The 12 °C and 5 °C points were chosen from backtests on three households: one with a heat pump and two years of history, and two with around two months each, one of whose load does not depend on the temperature.
+On the houses that heat with electricity, energy against outside temperature bends smoothly rather than at one point, and a single straight line fitted best starting from 10.5 to 12.5 °C rather than 15.5 °C.
+Moving the start to 12 °C and adding the cold term cut the error in the forecast daily total by 0.1 to 1 percentage point overall, and the under-forecast on days averaging below 2 °C by half or more, while moving the house whose load does not depend on temperature by only 0.2 points.
+A smooth curve (a cubic spline) was also tried, and did no better than the bend at 5 °C while needing more weights.
 
 "Same time of day" means whole days back from now. For up to a week after a clock change the profile is therefore an hour out against your household routine.
 
@@ -265,7 +278,7 @@ Rates could not be tested, as none of the four histories had a rate that varied 
 The weights are on `sensor.predbat_load_ml_stats` in the `weights` attribute (and `model` is `regression`), and in the log each time the model trains:
 
 ```text
-LoadReg Predictor: Fitted on 209136 forecast slots: load per 30 min = 0.104 + 0.743 x profile + 0.0305 x heating degrees above last week + 0.441 x last 2h above profile + 0.137 x last 24h above last week; holdout MAE 0.1656 kWh, bias -0.1019 kWh
+LoadReg Predictor: Fitted on 209136 forecast slots: load per 30 min = 0.104 + 0.743 x profile + 0.0245 x heating degrees above last week + 0.0410 x degrees below 5 C above last week (fitted) + 0.441 x last 2h above profile + 0.137 x last 24h above last week; holdout MAE 0.1656 kWh, bias -0.1019 kWh
 ```
 
 `sensor.predbat_load_ml_forecast` has a `breakdown` attribute alongside `results`. It holds one entry per 30-minute slot giving the kWh each term adds, and their total:
@@ -275,13 +288,14 @@ breakdown:
   "2026-11-12T18:00:00+0000":
     base: 0.1042
     profile: 0.5562
-    temperature: 0.0641
+    temperature: 0.0515
+    cold: 0.0410
     last_2h: 0.0356
     last_24h: 0.0306
-    total: 0.7907
+    total: 0.8191
 ```
 
-Read this one as: your profile for this time of day is 0.75 kWh a half hour (0.5562 / 0.743), the slot is forecast 2.1 °C colder than the week's average for the time (0.0641 / 0.0305), the last 2 hours ran 0.08 kWh a half hour above the profile, and the last day ran 0.22 kWh a half hour above the week.
+Read this one as: your profile for this time of day is 0.75 kWh a half hour (0.5562 / 0.743), the slot is forecast 2.1 °C colder than the week's average for the time (0.0515 / 0.0245) and 1.0 °C further below 5 °C than usual (0.0410 / 0.0410), the last 2 hours ran 0.08 kWh a half hour above the profile, and the last day ran 0.22 kWh a half hour above the week.
 The terms add up to the total unless the total was clipped at zero or at the 50 kW limit.
 
 The neural network's `rollout_mae_kwh`, `pattern_mae_kwh` and `epochs_trained` attributes are not published when LoadReg is selected.
@@ -691,7 +705,7 @@ Model version 11 (the first Predbat release after v9.9.0) is one such change: mo
 
 ### `predbat_ml_regression.npz` — the fitted LoadReg model
 
-Written only when LoadReg runs, as `load_ml_model: regression` or as the shadow. It holds the five weights, the training timestamp, the holdout `mae_kwh` and `bias_kwh`, and the LoadReg model version.
+Written only when LoadReg runs, as `load_ml_model: regression` or as the shadow. It holds the six weights (one per term, the cold weight being zero when it was not fitted), the training timestamp, the holdout `mae_kwh` and `bias_kwh`, and the LoadReg model version.
 It is reloaded on restart like the neural network's file, and can be deleted at any time to force a refit, which takes under a second.
 
 ### `predbat_ml_history.npz` — the accumulated history database
