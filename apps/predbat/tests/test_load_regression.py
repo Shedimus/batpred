@@ -16,7 +16,7 @@ import tempfile
 import os
 from unittest.mock import Mock
 
-from load_regression import LoadRegressionPredictor, MODEL_VERSION, MIN_HISTORY_DAYS, STEP_MINUTES, TERMS, HEATING_BASE_TEMP, COLD_TEMP
+from load_regression import LoadRegressionPredictor, MODEL_VERSION, MIN_HISTORY_DAYS, STEP_MINUTES, TERMS, HEAT_TERMS, HEATING_BASE_TEMP, COP_REFERENCE_TEMP, relative_cop, heat_input
 from load_predictor import LoadPredictor
 
 
@@ -26,7 +26,7 @@ def test_load_regression(my_predbat=None):
 
     Tests:
     - The regression recovering known weights, and its per-term breakdown
-    - The cold term, and the guard that leaves it out
+    - The heat input curve, the heat blocks by time of day, and dropping a negative heat weight
     - The trimmed time-of-day profile
     - Forecast format, with and without temperature data
     - Model save/load with version check
@@ -36,7 +36,9 @@ def test_load_regression(my_predbat=None):
     """
     sub_tests = [
         ("training_recovers_weights", _test_training_recovers_weights, "Fit recovers known weights and explain() adds up"),
-        ("cold_term", _test_cold_term, "Cold term learns a steeper slope below 5 C, and is left out without enough cold or with a negative slope"),
+        ("heat_input_curve", _test_heat_input_curve, "Heat input is zero above the base and rises faster than degrees as it gets colder"),
+        ("heat_blocks", _test_heat_blocks, "Heating in one part of the day is learned by that block's weight, placed by local time"),
+        ("negative_heat_dropped", _test_negative_heat_dropped, "A heat weight that comes out negative is dropped and the rest refitted"),
         ("profile_ignores_spike", _test_profile_ignores_one_off_spike, "Profile leaves out a one-off spike but keeps the day's energy"),
         ("prediction", _test_prediction, "End-to-end prediction"),
         ("prediction_without_temperature", _test_prediction_without_temperature, "Prediction with no temperature data, and with no temperature forecast"),
@@ -103,63 +105,94 @@ def _create_synthetic_load_data(n_days=7, now_utc=None):
     return load_minutes
 
 
+def _minutes_now(now_utc):
+    """Local minutes since midnight, the tests' clock being UTC."""
+    return now_utc.hour * 60 + now_utc.minute
+
+
 def _test_training_recovers_weights():
-    """Load built as a daily shape plus 0.03 kWh per heating degree per 30 minutes is close to profile x 1 + temperature x 0.03, with no cold term."""
+    """Load built as a daily shape plus 0.03 kWh per unit of heat input per 30 minutes is close to profile x 1 + 0.03 x each heat block."""
     now_utc = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
     temp_data = _create_synthetic_temp_data(n_days=21, now_utc=now_utc, forecast_hours=48)
 
     def load_at(minute):
         """Energy in the 5 minutes that ended this many minutes ago (negative = future)."""
-        return (0.3 + 0.2 * np.sin(2 * np.pi * minute / 1440.0)) / 6 + 0.005 * (HEATING_BASE_TEMP - temp_data[minute])
+        return (0.3 + 0.2 * np.sin(2 * np.pi * minute / 1440.0)) / 6 + 0.005 * heat_input(temp_data[minute])
 
     load_data = {minute: load_at(minute) for minute in temp_data if minute >= 0}
 
     predictor = LoadRegressionPredictor()
-    val_mae = predictor.train(load_data, temp_minutes=temp_data)
+    val_mae = predictor.train(load_data, temp_minutes=temp_data, minutes_now=_minutes_now(now_utc))
     # Not exact: the profile leaves out the coldest day at each time of day and is then rescaled
-    assert val_mae is not None and val_mae < 1e-3, f"Holdout error should be close to zero on data the model fits, got {val_mae}"
-    expected = {"base": 0.0, "profile": 1.0, "temperature": 0.03, "cold": 0.0, "last_2h": 0.0, "last_24h": 0.0}
-    assert np.allclose(predictor.weights, [expected[term] for term in TERMS], atol=0.05), f"Weights {dict(zip(TERMS, predictor.weights))}"
+    assert val_mae is not None and val_mae < 2e-3, f"Holdout error should be close to zero on data the model fits, got {val_mae}"
+    expected = {"base": 0.0, "profile": 1.0, "heat_night": 0.03, "heat_day": 0.03, "heat_evening": 0.03, "heat_daily": 0.0, "last_2h": 0.0, "last_24h": 0.0}
+    tolerance = [0.01 if term.startswith("heat_") else 0.05 for term in TERMS]
+    assert np.all(np.abs(predictor.weights - [expected[term] for term in TERMS]) < tolerance), f"Weights {dict(zip(TERMS, predictor.weights))}"
+    assert predictor.weights[TERMS.index("profile")] == 1.0, "The profile weight is fixed at 1"
 
-    predictions = predictor.predict(load_data, temp_minutes=temp_data)
-    breakdown = predictor.explain(load_data, temp_minutes=temp_data)
+    predictions = predictor.predict(load_data, temp_minutes=temp_data, minutes_now=_minutes_now(now_utc))
+    breakdown = predictor.explain(load_data, temp_minutes=temp_data, minutes_now=_minutes_now(now_utc))
     assert sorted(breakdown) == list(range(0, 48 * 60, 30)), "One breakdown per 30-minute slot"
     cumulative = 0
     for minute, terms in breakdown.items():
         expected = sum(load_at(-(minute + step)) for step in range(5, 35, 5))
-        assert abs(terms["total"] - expected) < 2e-3, f"Slot at +{minute} min: forecast {terms['total']}, truth {expected}"
+        assert abs(terms["total"] - expected) < 3e-3, f"Slot at +{minute} min: forecast {terms['total']}, truth {expected}"
         assert abs(sum(terms[term] for term in TERMS) - terms["total"]) < 1e-3, f"Terms should add up to the total: {terms}"
         cumulative += terms["total"]
         assert abs(predictions[minute + 25] - cumulative) < 1e-2, "Forecast should be the running sum of the slot totals"
-    assert any(abs(terms["temperature"]) > 0.005 for terms in breakdown.values()), "Temperature forecast should move the forecast"
+    for term in ["heat_night", "heat_day", "heat_evening"]:
+        assert any(abs(terms[term]) > 0.005 for terms in breakdown.values()), f"Temperature forecast should move the forecast through {term}"
 
 
-def _test_cold_term():
-    """A steeper slope below COLD_TEMP is learned as the cold weight; too little cold weather, or a slope that comes out negative, leaves it at zero."""
+def _test_heat_input_curve():
+    """Heat input is heating degrees divided by a COP that falls as it gets colder: none above the base, more than degrees below 7 C."""
+    assert abs(relative_cop(COP_REFERENCE_TEMP) - 1.0) < 1e-12
+    assert heat_input(HEATING_BASE_TEMP) == 0 and heat_input(20.0) == 0, "No heat input above the heating base temperature"
+    temps = np.arange(HEATING_BASE_TEMP, -15.0, -0.5)
+    heat = heat_input(temps)
+    assert np.all(np.diff(heat) > 0), "Heat input should rise all the way down"
+    assert np.all(np.diff(heat) >= np.diff(heat)[0] - 1e-9), "Each degree colder should add at least as much as the last"
+    # Close to rated heat pumps: the COP at 2 C and -7 C is about 0.8 and 0.55 of that at 7 C
+    assert 0.75 < relative_cop(2.0) < 0.85 and 0.5 < relative_cop(-7.0) < 0.65, f"COP ratios {relative_cop(2.0)}, {relative_cop(-7.0)}"
+
+
+def _test_heat_blocks():
+    """Heating that only runs in the evening is learned by heat_evening; the slots are placed by the local time passed in."""
     now_utc = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    temp_data = _create_synthetic_temp_data(n_days=21, now_utc=now_utc, forecast_hours=48)
 
-    def fit(cold_slope, offset):
-        temp_data = _create_synthetic_temp_data(n_days=21, now_utc=now_utc, forecast_hours=48, offset=offset)
-        load_data = {minute: (0.3 + 0.2 * np.sin(2 * np.pi * minute / 1440.0)) / 6 + 0.005 * max(HEATING_BASE_TEMP - temp, 0) + cold_slope * max(COLD_TEMP - temp, 0) for minute, temp in temp_data.items() if minute >= 0}
-        predictor = LoadRegressionPredictor()
-        assert predictor.train(load_data, temp_minutes=temp_data) is not None
-        return predictor, dict(zip(TERMS, predictor.weights)), predictor.explain(load_data, temp_minutes=temp_data)
+    def load_at(minute):
+        hour = (now_utc - timedelta(minutes=minute + STEP_MINUTES)).hour  # Hour the 5 minutes started in
+        evening = 0.01 * heat_input(temp_data[minute]) if 16 <= hour < 22 else 0.0
+        return (0.3 + 0.2 * np.sin(2 * np.pi * minute / 1440.0)) / 6 + evening
 
-    # 0.01 kWh per 5 minutes is 0.06 per 30 minutes for each degree below COLD_TEMP, on top of 0.03 per heating degree
-    predictor, weights, breakdown = fit(0.01, 0.0)
-    assert predictor.cold_fitted, "Plenty of hours below COLD_TEMP should fit the cold term"
-    assert abs(weights["cold"] - 0.06) < 0.02 and abs(weights["temperature"] - 0.03) < 0.02, f"Weights {weights}"
-    assert any(abs(terms["cold"]) > 0.005 for terms in breakdown.values()), "Cold forecast should move the forecast"
-    assert all(abs(sum(terms[term] for term in TERMS) - terms["total"]) < 1e-3 for terms in breakdown.values()), "Terms should add up to the total"
+    load_data = {minute: load_at(minute) for minute in temp_data if minute >= 0}
+    predictor = LoadRegressionPredictor()
+    assert predictor.train(load_data, temp_minutes=temp_data, minutes_now=_minutes_now(now_utc)) is not None
+    weights = dict(zip(TERMS, predictor.weights))
+    assert abs(weights["heat_evening"] - 0.06) < 0.01, f"Weights {weights}"
+    assert abs(weights["heat_night"]) < 0.01 and abs(weights["heat_day"]) < 0.01, f"Weights {weights}"
 
-    # 4.5 to 12.5 C: never 3 days' worth of half hours below COLD_TEMP, so no cold term even though the data has one
-    predictor, weights, _ = fit(0.01, 3.0)
-    assert not predictor.cold_fitted and weights["cold"] == 0.0, f"Too little cold weather should leave the cold term out: {weights}"
+    # Told it is six hours later than it is, the evening heating lands in the wrong block and fits worse
+    shifted = LoadRegressionPredictor()
+    assert shifted.train(load_data, temp_minutes=temp_data, minutes_now=_minutes_now(now_utc) + 360) is not None
+    assert shifted.validation_mae > 2 * predictor.validation_mae, f"Wrong clock MAE {shifted.validation_mae} vs {predictor.validation_mae}"
 
-    # Using less energy the colder it gets below COLD_TEMP is not heating, so the term is refitted out
-    predictor, weights, _ = fit(-0.004, 0.0)
-    assert not predictor.cold_fitted and weights["cold"] == 0.0, f"A negative cold slope should be dropped: {weights}"
-    assert weights["temperature"] > 0, f"Weights {weights}"
+
+def _test_negative_heat_dropped():
+    """Using less energy the colder it gets is not heating: the heat terms are dropped rather than fitted negative."""
+    now_utc = datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    temp_data = _create_synthetic_temp_data(n_days=21, now_utc=now_utc, forecast_hours=48)
+    load_data = {minute: max((0.3 + 0.2 * np.sin(2 * np.pi * minute / 1440.0)) / 6 - 0.002 * heat_input(temp), 0.0) for minute, temp in temp_data.items() if minute >= 0}
+
+    predictor = LoadRegressionPredictor()
+    assert predictor.train(load_data, temp_minutes=temp_data, minutes_now=_minutes_now(now_utc)) is not None
+    weights = dict(zip(TERMS, predictor.weights))
+    assert all(weights[term] >= 0 for term in HEAT_TERMS), f"No heat weight should be negative: {weights}"
+    assert predictor.heat_dropped, "At least one heat term should have been dropped"
+    assert all(weights[term] == 0.0 for term in predictor.heat_dropped), f"Dropped terms should have zero weight: {weights}"
+    breakdown = predictor.explain(load_data, temp_minutes=temp_data, minutes_now=_minutes_now(now_utc))
+    assert all(abs(sum(terms[term] for term in TERMS) - terms["total"]) < 1e-3 for terms in breakdown.values() if terms["total"] > 0), "Terms should add up to the total"
 
 
 def _test_profile_ignores_one_off_spike():
@@ -206,21 +239,22 @@ def _test_prediction():
 
 
 def _test_prediction_without_temperature():
-    """With no temperature at all the temperature weight is zero; with no forecast the temperature term is."""
+    """With no temperature at all the heat weights are zero; with no forecast the heat terms are."""
     np.random.seed(42)
     now_utc = datetime.now(timezone.utc)
     load_data = _create_synthetic_load_data(n_days=14, now_utc=now_utc)
 
     predictor = LoadRegressionPredictor()
     assert predictor.train(load_data) is not None
-    assert abs(predictor.weights[TERMS.index("temperature")]) < 1e-9, "No temperature data should give no temperature weight"
+    assert all(abs(predictor.weights[TERMS.index(term)]) < 1e-9 for term in HEAT_TERMS), "No temperature data should give no heat weights"
     assert len(predictor.predict(load_data)) == 48 * 60 // STEP_MINUTES
 
     predictor = LoadRegressionPredictor()
     history_only = _create_synthetic_temp_data(n_days=14, now_utc=now_utc, forecast_hours=0)
     assert predictor.train(load_data, temp_minutes=history_only) is not None
     breakdown = predictor.explain(load_data, temp_minutes=history_only)
-    assert len(breakdown) == 96 and all(terms["temperature"] == 0 for terms in breakdown.values()), "A missing temperature forecast should leave the forecast unadjusted"
+    # heat_daily still sees the known half of the 24 hours around the first slots, so only the slot terms are checked
+    assert len(breakdown) == 96 and all(terms[term] == 0 for terms in breakdown.values() for term in ["heat_night", "heat_day", "heat_evening"]), "A missing temperature forecast should leave the slot heat terms out"
 
 
 def _test_model_persistence():

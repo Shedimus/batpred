@@ -796,8 +796,9 @@ class LoadMLComponent(ComponentBase):
             {minutes_ahead: {term: kwh}} per 30-minute slot and empty for the MLP
         """
         if model == "regression":
-            predictions = predictor.predict(self.load_data, temp_minutes=self.temperature_data)
-            return predictions, predictor.explain(self.load_data, temp_minutes=self.temperature_data) if predictions else {}
+            minutes_now = self.minutes_now
+            predictions = predictor.predict(self.load_data, temp_minutes=self.temperature_data, minutes_now=minutes_now)
+            return predictions, predictor.explain(self.load_data, temp_minutes=self.temperature_data, minutes_now=minutes_now) if predictions else {}
         predictions = predictor.predict(
             self.load_data,
             now_utc,
@@ -1131,6 +1132,7 @@ class LoadMLComponent(ComponentBase):
                 "import_rates": dict(self.import_rates_data) if self.import_rates_data else {},
                 "export_rates": dict(self.export_rates_data) if self.export_rates_data else {},
                 "now_utc": self.now_utc,
+                "minutes_now": self.minutes_now,  # Local time of day at minute 0 of the data, for LoadReg's heat blocks
             }
 
     def _fit(self, model, predictor, snapshot, is_initial):
@@ -1148,7 +1150,7 @@ class LoadMLComponent(ComponentBase):
         """
         if model == "regression":
             # A least-squares fit, well under a second, so there is no curriculum or fine-tuning
-            return predictor.train(snapshot["load"], temp_minutes=snapshot["temp"])
+            return predictor.train(snapshot["load"], temp_minutes=snapshot["temp"], minutes_now=snapshot["minutes_now"])
 
         # Curriculum: progressively expand the training window from oldest week forward so the model
         # learns gradually from historical structure. The initial training takes bigger steps over more passes.
@@ -1332,6 +1334,7 @@ class LoadMLComponent(ComponentBase):
             return forecast_extra, {
                 "model_version": load_regression.MODEL_VERSION,
                 "weights": {term: round(float(weight), 4) for term, weight in zip(load_regression.TERMS, weights)} if weights is not None else None,
+                "heat_dropped": list(predictor.heat_dropped) if predictor else [],
             }
         return {}, {
             # Multi-step rollout error and the daily-pattern baseline it is scored against.

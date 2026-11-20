@@ -2119,7 +2119,7 @@ For a detailed explanation of how the neural network works and comprehensive con
 | `load_ml_database_days` | Integer | No | 90 | `load_ml_database_days` | Days of history to accumulate in the on-disk database (`predbat_ml_history.npz`); set to 0 to disable the database |
 | `load_ml_retrain_interval_hours` | Integer | No | 2 | `load_ml_retrain_interval_hours` | Hours between training cycles (1–48); use 24 for daily retraining. Predictions still update every 30 minutes |
 | `load_ml_shadow` | Boolean | No | false | `load_ml_shadow` | Also run the model not chosen by `load_ml_model` and publish its forecast to `sensor.predbat_load_ml_shadow_forecast` and `_shadow_stats` for comparison. The plan never uses it. See [shadow mode](load-ml.md#comparing-the-two-models-shadow-mode) |
-| `load_ml_model` | String | No | mlp | `load_ml_model` | `mlp` for the neural network, or `regression` for [LoadReg](load-ml.md#loadreg-the-regression-model), a five-input linear regression that trains in under a second and needs 10 days of history |
+| `load_ml_model` | String | No | mlp | `load_ml_model` | `mlp` for the neural network, or `regression` for [LoadReg](load-ml.md#loadreg-the-regression-model), a linear regression that trains in under a second and needs 10 days of history |
 
 Note: **load_today**, **pv_today** and **car_charging_energy** `apps.yaml` configuration items are also used, but these should already be set in Predbat.
 
