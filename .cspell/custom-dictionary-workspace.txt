@@ -36,6 +36,7 @@ appsyaml
 argname
 armhf
 armv
+aroTHERM
 ASHP
 asn
 asname
@@ -85,6 +86,7 @@ calcsize
 calib
 callees
 Cantarell
+Carnot
 cbat
 CDLL
 cdn
@@ -822,6 +824,7 @@ usegmt
 useid
 userinterface
 utcoffset
+Vaillant
 Vallery
 varh
 venv
